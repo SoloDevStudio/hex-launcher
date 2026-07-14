@@ -191,8 +191,9 @@ def write_settings(cuo_exe: Path, client_dir: Path) -> Path:
 
 def launch(cuo_exe: Path) -> None:
     print(f"\n[*] Launching {SHARD_NAME} ...")
-    print("    First time? Type the username and password you WANT at the")
-    print("    login screen -- that creates your account. Write it down:")
+    print("    First time? Log in with your EMAIL ADDRESS (under 30 characters)")
+    print("    and the password you WANT -- that creates your account, and a")
+    print("    verification code lands in your inbox. Write the password down:")
     print("    whatever you type first IS your password.\n")
     subprocess.Popen([str(cuo_exe)], cwd=str(cuo_exe.parent))
 
