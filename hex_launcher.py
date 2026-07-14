@@ -25,6 +25,7 @@ import json
 import os
 import platform
 import queue
+import re
 import stat
 import subprocess
 import sys
@@ -366,8 +367,12 @@ def run_gui(args) -> int:
     def set_status(msg: str) -> None:
         root.after(0, status_var.set, msg)
 
-    # Technical output goes to a quiet log file for support -- no UI for it.
+    # Technical output goes to a quiet log file for support -- no UI for it,
+    # except download-progress lines, which drive the progress bar below.
     log_file = Path.home() / ".hexuo-launcher.log"
+
+    _patch_progress = re.compile(r"\[(\d+)/(\d+) files\] \[([\d.]+)/([\d.]+) MB\] \[([\d.]+)%\]")
+    _cuo_progress = re.compile(r"^\s*(\d{1,3})%\s*$")
 
     def pump_log() -> None:
         lines = []
@@ -377,6 +382,18 @@ def run_gui(args) -> int:
         except queue.Empty:
             pass
         if lines:
+            for line in lines:
+                m = _patch_progress.search(line)
+                if m:
+                    set_progress(float(m.group(5)))
+                    status_var.set(
+                        f"Downloading game files -- {float(m.group(3)):.0f} of {float(m.group(4)):.0f} MB ({float(m.group(5)):.0f}%)"
+                    )
+                    continue
+                m = _cuo_progress.match(line)
+                if m:
+                    set_progress(int(m.group(1)))
+                    status_var.set(f"Downloading the game client -- {m.group(1)}%")
             try:
                 with open(log_file, "a", encoding="utf-8") as f:
                     f.write("\n".join(lines) + "\n")
@@ -450,6 +467,21 @@ def run_gui(args) -> int:
     # ----- play button -----
     play_btn = ttk.Button(root, text="▶  PLAY", state="disabled")
     play_btn.pack(pady=(0, 18), ipadx=30, ipady=6)
+
+    # ----- download progress bar (appears only while downloading) -----
+    progress_bar = ttk.Progressbar(root, mode="determinate", maximum=100)
+    _progress_shown = [False]
+
+    def set_progress(pct) -> None:
+        if not _progress_shown[0]:
+            progress_bar.pack(fill="x", padx=40, pady=(0, 8), before=play_btn)
+            _progress_shown[0] = True
+        progress_bar["value"] = pct
+
+    def hide_progress() -> None:
+        if _progress_shown[0]:
+            progress_bar.pack_forget()
+            _progress_shown[0] = False
 
     def busy(b: bool) -> None:
         action_btn.configure(state="disabled" if b else "normal")
@@ -642,6 +674,7 @@ def run_gui(args) -> int:
             state["settings_path"] = settings_path
 
             def finish():
+                hide_progress()
                 if saved_username(settings_path):
                     account_done()
                 else:
