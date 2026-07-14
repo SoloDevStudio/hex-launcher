@@ -23,6 +23,7 @@ File addressing:
 """
 
 import argparse
+import http.client
 import os
 import sys
 import struct
@@ -30,6 +31,7 @@ import zlib
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from urllib.parse import urlsplit
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
 import shutil
@@ -114,14 +116,110 @@ def log(msg):
     with _print_lock:
         print(msg, flush=True)
 
-def fetch_bytes(url, retries=3):
-    """Download raw bytes from a URL with retries."""
+
+# Optional progress hook for GUI frontends. Called as hook(event, value):
+#   ('phase', str)  -- human-readable step name
+#   ('total', int)  -- add N bytes to the grand download total (may be negative)
+#   ('bytes', int)  -- N more bytes downloaded/verified (negative rolls back a failed attempt)
+progress_hook = None
+
+
+def _emit(event, value=None):
+    hook = progress_hook
+    if hook is not None:
+        try:
+            hook(event, value)
+        except Exception:
+            pass
+
+
+def _dl_size(entry):
+    """Bytes that actually travel over the wire for a manifest entry."""
+    return entry['cl'] if entry['ct'] == 1 else entry['ul']
+
+
+def fetch_bytes(url, retries=3, count=False):
+    """Download raw bytes from a URL with retries.
+
+    count=True streams the body and reports byte deltas to the progress hook
+    (rolled back if the attempt fails, so retries never double-count).
+    """
     for attempt in range(retries):
+        got = 0
         try:
             req = Request(url, headers={"User-Agent": "UO Patcher/1.0"})
             with urlopen(req, timeout=30) as resp:
-                return resp.read()
+                if not count:
+                    return resp.read()
+                chunks = []
+                while True:
+                    chunk = resp.read(1 << 16)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    got += len(chunk)
+                    _emit('bytes', len(chunk))
+                return b''.join(chunks)
         except (HTTPError, URLError, TimeoutError) as e:
+            if got:
+                _emit('bytes', -got)
+            if attempt == retries - 1:
+                raise
+            time.sleep(1 * (attempt + 1))
+    return b''
+
+
+# Per-thread keep-alive connections for the pack-chunk phase: tens of
+# thousands of tiny files where per-request TCP setup, not bandwidth, is
+# the bottleneck. urllib opens a fresh connection every time; this reuses one
+# HTTP connection per (thread, host) and is dramatically faster.
+_conn_local = threading.local()
+
+
+def fetch_bytes_pooled(url, retries=3, count=False):
+    """fetch_bytes with HTTP keep-alive. Falls back to fetch_bytes for https."""
+    parts = urlsplit(url)
+    if parts.scheme != 'http':
+        return fetch_bytes(url, retries, count=count)
+
+    conns = getattr(_conn_local, 'conns', None)
+    if conns is None:
+        conns = _conn_local.conns = {}
+
+    path = parts.path or '/'
+    if parts.query:
+        path += '?' + parts.query
+
+    for attempt in range(retries):
+        got = 0
+        conn = conns.get(parts.netloc)
+        try:
+            if conn is None:
+                conn = http.client.HTTPConnection(parts.netloc, timeout=30)
+                conns[parts.netloc] = conn
+            conn.request('GET', path, headers={"User-Agent": "UO Patcher/1.0"})
+            resp = conn.getresponse()
+            if resp.status != 200:
+                resp.read()  # drain so the connection stays reusable
+                raise HTTPError(url, resp.status, resp.reason, resp.headers, None)
+            chunks = []
+            while True:
+                chunk = resp.read(1 << 16)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if count:
+                    got += len(chunk)
+                    _emit('bytes', len(chunk))
+            return b''.join(chunks)
+        except (HTTPError, http.client.HTTPException, OSError):
+            if got:
+                _emit('bytes', -got)
+            try:
+                conn.close()
+            except Exception:
+                pass
+            conns[parts.netloc] = None
             if attempt == retries - 1:
                 raise
             time.sleep(1 * (attempt + 1))
@@ -372,13 +470,14 @@ def _download_one_unpacked(file_repo, entry, output_dir):
         if out_path.suffix == '.uop' and not is_official_uop(str(out_path)):
             pass  # fall through to re-download
         else:
+            _emit('bytes', _dl_size(entry))
             return (entry, None, True)  # (entry, error, was_skipped)
 
     h = filename_hash(name)
     url = f"{file_repo}base/unpacked/{h}"
 
     try:
-        data = fetch_bytes(url)
+        data = fetch_bytes(url, count=True)
         if ct == 1:
             data = zlib.decompress(data)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -403,7 +502,7 @@ def _download_one_pack_entry(file_repo, entry, output_dir):
     tmp_file = chunk_dir / f"{ph:08x}{sh:08x}.tmp"
 
     try:
-        data = fetch_bytes(url)
+        data = fetch_bytes_pooled(url, count=True)
         tmp_file.write_bytes(data)
         tmp_file.rename(final_file)
         return (entry, None)
@@ -450,15 +549,18 @@ def download_packs_parallel(file_repo, entries, output_dir, workers, pack_index=
     # Determine which entries need downloading
     need_download = []
     skipped_count = 0
+    skipped_bytes = 0
     for entry in entries:
         if pack_index is not None:
             key = (entry['pack_name'], entry['ph'], entry['sh'])
             if key in pack_index and pack_index[key] == entry['ul']:
                 skipped_count += 1
+                skipped_bytes += _dl_size(entry)
                 continue
         need_download.append(entry)
 
     if skipped_count:
+        _emit('bytes', skipped_bytes)
         log(f"  {skipped_count} pack entries already up-to-date, {len(need_download)} need download")
     if not need_download:
         return []
@@ -466,6 +568,10 @@ def download_packs_parallel(file_repo, entries, output_dir, workers, pack_index=
     total_bytes = sum(e['cl'] if e['ct'] == 1 else e['ul'] for e in need_download)
     progress = ProgressTracker(len(need_download), total_bytes)
     failed = []
+
+    # These entries are thousands of tiny files, so a files-done count is the
+    # honest progress unit for the GUI (byte rates look near-zero here).
+    _emit('files', (0, len(need_download)))
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_download_one_pack_entry, file_repo, e, output_dir): e for e in need_download}
@@ -478,6 +584,8 @@ def download_packs_parallel(file_repo, entries, output_dir, workers, pack_index=
                 failed.append(entry)
             else:
                 progress.update(dl_size)
+            if (i + 1) % 100 == 0 or (i + 1) == len(futures):
+                _emit('files', (i + 1, len(futures)))
             if (i + 1) % 500 == 0 or (i + 1) == len(futures):
                 log(progress.status())
 
@@ -710,6 +818,8 @@ def run_patch(output_dir, prod_url=None, workers=8, dry_run=False, no_verify=Fal
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    _emit('phase', 'Contacting the patch server')
+
     # 1. Fetch product file
     prod = parse_prod(prod_url)
     manifest_repo = prod['manifest_repos'][0]
@@ -725,6 +835,13 @@ def run_patch(output_dir, prod_url=None, workers=8, dry_run=False, no_verify=Fal
     all_packs = []
 
     for stage in prod['stages']:
+        # The 'notes' stage is patcher-UI patch notes (HTML/images) that the
+        # EA CDN no longer hosts -- every file 404s, wasting minutes of retries
+        # and leaving phantom bytes in the progress total. The game never
+        # reads them; skip the stage outright.
+        if stage['name'] == 'notes':
+            log(f"\n[*] Skipping stage: {stage['name']} (patch notes, not hosted on CDN)")
+            continue
         log(f"\n[*] Processing stage: {stage['name']}")
         for pkg in stage['packages']:
             log(f"  Package: {pkg['name']} (rpath={pkg['rpath']})")
@@ -742,8 +859,17 @@ def run_patch(output_dir, prod_url=None, workers=8, dry_run=False, no_verify=Fal
             unique_packs.append(e)
     all_packs = unique_packs
 
-    total_unpacked_bytes = sum(e['cl'] if e['ct'] == 1 else e['ul'] for e in all_unpacked)
-    total_pack_bytes = sum(e['cl'] if e['ct'] == 1 else e['ul'] for e in all_packs)
+    total_unpacked_bytes = sum(_dl_size(e) for e in all_unpacked)
+    total_pack_bytes = sum(_dl_size(e) for e in all_packs)
+
+    # Grand total for the progress bar: pack entries whose whole .uop arrives as
+    # an unpacked download are (in the normal case) never fetched individually,
+    # so count only the residue up front. If a .uop later fails its signature
+    # check, the difference is added back at filter time below.
+    unpacked_uop_names = set(e['name'] for e in all_unpacked if e['name'].endswith('.uop'))
+    expected_pack_bytes = sum(_dl_size(e) for e in all_packs
+                              if e['pack_name'] not in unpacked_uop_names)
+    _emit('total', total_unpacked_bytes + expected_pack_bytes)
 
     log(f"\n{'='*60}")
     log(f"[*] Total unpacked files: {len(all_unpacked)}")
@@ -756,6 +882,7 @@ def run_patch(output_dir, prod_url=None, workers=8, dry_run=False, no_verify=Fal
         return
 
     # 3. Download unpacked files with retry loop
+    _emit('phase', 'Downloading game files')
     log(f"\n[*] Downloading {len(all_unpacked)} unpacked files...")
     failed_unpacked = download_unpacked_parallel(file_repo, all_unpacked, output_dir, workers)
 
@@ -783,16 +910,27 @@ def run_patch(output_dir, prod_url=None, workers=8, dry_run=False, no_verify=Fal
         else:
             log(f"\n[*] All {len(official_uops)} pack archives already present as valid EA downloads")
 
+    # Reconcile the progress total with what actually still needs downloading
+    # (nonzero only when a .uop failed its signature check and its chunks must
+    # be fetched individually after all).
+    kept_pack_bytes = sum(_dl_size(e) for e in all_packs)
+    if kept_pack_bytes != expected_pack_bytes:
+        _emit('total', kept_pack_bytes - expected_pack_bytes)
+
     # 5. Download remaining pack files with retry loop
     if all_packs:
         pack_names = set(e['pack_name'] for e in all_packs)
+        _emit('phase', 'Scanning existing game files')
         log(f"\n[*] Scanning {len(pack_names)} .uop archives for incremental update...")
         pack_index = build_pack_index(output_dir, pack_names)
         if pack_index:
             log(f"  Found {len(pack_index)} existing entries in local archives")
 
-        log(f"[*] Downloading {len(all_packs)} pack entries ({workers} threads)...")
-        failed_packs = download_packs_parallel(file_repo, all_packs, output_dir, workers, pack_index)
+        # Tiny-file phase is latency-bound, not bandwidth-bound: use more threads.
+        pack_workers = min(workers * 2, 32)
+        _emit('phase', 'Downloading game files')
+        log(f"[*] Downloading {len(all_packs)} pack entries ({pack_workers} threads)...")
+        failed_packs = download_packs_parallel(file_repo, all_packs, output_dir, pack_workers, pack_index)
 
         # Retry failed pack downloads
         for attempt in range(1, retries + 1):
@@ -800,7 +938,7 @@ def run_patch(output_dir, prod_url=None, workers=8, dry_run=False, no_verify=Fal
                 break
             time.sleep(2)
             log(f"\n[*] Retry {attempt}/{retries}: re-downloading {len(failed_packs)} pack entries...")
-            failed_packs = download_packs_parallel(file_repo, failed_packs, output_dir, workers)
+            failed_packs = download_packs_parallel(file_repo, failed_packs, output_dir, pack_workers)
 
         # 6. Build MYP archives (only for packs without valid EA unpacked downloads)
         staging_dir = Path(output_dir) / '.pack_staging'
@@ -819,6 +957,7 @@ def run_patch(output_dir, prod_url=None, workers=8, dry_run=False, no_verify=Fal
                     shutil.rmtree(pack_staging, ignore_errors=True)
 
         if updated_packs:
+            _emit('phase', 'Assembling game archives')
             log(f"\n[*] Building {len(updated_packs)} MYP archives...")
             pack_groups = {}
             for e in all_packs:
@@ -838,6 +977,7 @@ def run_patch(output_dir, prod_url=None, workers=8, dry_run=False, no_verify=Fal
 
         # 6. Verify archives and retry if needed
         if not no_verify:
+            _emit('phase', 'Verifying game files')
             log(f"\n[*] Verifying pack archives...")
             failed_verify = verify_archives(output_dir, all_packs)
 
@@ -878,6 +1018,7 @@ def run_patch(output_dir, prod_url=None, workers=8, dry_run=False, no_verify=Fal
 
     # 7. Verify unpacked files
     if not no_verify and all_unpacked:
+        _emit('phase', 'Verifying game files')
         log(f"\n[*] Verifying unpacked files...")
         still_failed = verify_unpacked(output_dir, all_unpacked)
         if still_failed:

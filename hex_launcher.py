@@ -25,14 +25,15 @@ import json
 import os
 import platform
 import queue
-import re
 import stat
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 import zipfile
+from collections import deque
 from pathlib import Path
 
 import uo_patcher
@@ -111,22 +112,37 @@ def ensure_game_files(client_dir: Path, skip: bool) -> None:
     print(f"[*] Game files: {client_dir}")
     print("[*] Downloading/verifying from the official patch servers.")
     print("    First install is ~1.6 GB -- later runs only fetch what changed.\n")
-    uo_patcher.run_patch(str(client_dir))
+    # 16 workers: the patch tail is thousands of tiny files, latency-bound.
+    uo_patcher.run_patch(str(client_dir), workers=16)
 
 
 # ---------------------------------------------------------------------------
 # Step 2: ClassicUO
 # ---------------------------------------------------------------------------
 
-def _download_with_progress(url: str, dest: Path, attempts: int = 3) -> None:
+def _remote_size(url: str) -> int:
+    """Content-Length via HEAD, or 0 if the server won't say."""
+    try:
+        req = urllib.request.Request(url, method="HEAD",
+                                     headers={"User-Agent": "HexLauncher/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return int(resp.headers.get("Content-Length") or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _download_with_progress(url: str, dest: Path, attempts: int = 3,
+                            on_bytes=None, on_total=None) -> None:
     last_err = None
     for attempt in range(1, attempts + 1):
+        done = 0
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "HexLauncher/1.0"})
             # timeout guards against a stalled connection hanging setup forever.
             with urllib.request.urlopen(req, timeout=30) as resp, open(dest, "wb") as out:
                 total = int(resp.headers.get("Content-Length") or 0)
-                done = 0
+                if total and on_total:
+                    on_total(total)
                 next_mark = 10
                 while True:
                     chunk = resp.read(1 << 16)
@@ -134,12 +150,16 @@ def _download_with_progress(url: str, dest: Path, attempts: int = 3) -> None:
                         break
                     out.write(chunk)
                     done += len(chunk)
+                    if on_bytes:
+                        on_bytes(len(chunk))
                     if total and done * 100 // total >= next_mark:
                         print(f"    {done * 100 // total}%")
                         next_mark += 10
             return
         except Exception as e:  # noqa: BLE001
             last_err = e
+            if done and on_bytes:
+                on_bytes(-done)  # roll back so the retry doesn't double-count
             print(f"[!] Download attempt {attempt} failed: {e}")
             dest.unlink(missing_ok=True)
     raise RuntimeError(f"Could not download after {attempts} tries: {last_err}")
@@ -154,7 +174,7 @@ def find_cuo_executable(cuo_dir: Path) -> Path | None:
     return None
 
 
-def ensure_classicuo(cuo_dir: Path, force: bool) -> Path:
+def ensure_classicuo(cuo_dir: Path, force: bool, progress=None) -> Path:
     exe = find_cuo_executable(cuo_dir)
     if exe and not force:
         print(f"[*] ClassicUO already installed: {exe}")
@@ -169,9 +189,17 @@ def ensure_classicuo(cuo_dir: Path, force: bool) -> Path:
     cuo_dir.mkdir(parents=True, exist_ok=True)
     zip_path = cuo_dir / asset
     print(f"[*] Downloading ClassicUO ({system}) ...")
-    _download_with_progress(url, zip_path)
+    if progress:
+        progress.set_phase("Downloading the game client")
+    _download_with_progress(
+        url, zip_path,
+        on_bytes=progress.add_bytes if progress else None,
+        on_total=progress.ensure_cuo_total if progress else None,
+    )
 
     print("[*] Extracting ...")
+    if progress:
+        progress.set_phase("Unpacking the game client")
     with zipfile.ZipFile(zip_path) as zf:
         zf.extractall(cuo_dir)
     zip_path.unlink()
@@ -325,6 +353,70 @@ def launch(cuo_exe: Path) -> None:
 # Graphical launcher (default)
 # ---------------------------------------------------------------------------
 
+class _SetupProgress:
+    """Single source of truth for the setup progress bar.
+
+    One grand byte total covers the whole install -- game files (fed by
+    uo_patcher's progress hook) plus the ClassicUO zip -- so the bar moves
+    0 -> 100% exactly once, with real speed and time-remaining.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.phase = ""
+        self.done = 0
+        self.total = 0
+        self.files = (0, 0)  # (done, total) for tiny-file phases
+        self._cuo_total = 0
+        # Sample deques are touched by the GUI thread only.
+        self.samples: deque = deque()   # (monotonic_time, done_bytes)
+        self.fsamples: deque = deque()  # (monotonic_time, files_done)
+
+    def hook(self, event, value=None):  # uo_patcher.progress_hook signature
+        with self.lock:
+            if event == "phase":
+                self.phase = value or ""
+                self.files = (0, 0)
+            elif event == "total":
+                self.total += int(value or 0)
+            elif event == "bytes":
+                self.done += int(value or 0)
+            elif event == "files":
+                self.files = tuple(value) if value else (0, 0)
+
+    def set_phase(self, name: str) -> None:
+        self.hook("phase", name)
+
+    def add_bytes(self, n: int) -> None:
+        self.hook("bytes", n)
+
+    def add_cuo_total(self, n: int) -> None:
+        with self.lock:
+            self._cuo_total = n
+            self.total += n
+
+    def ensure_cuo_total(self, n: int) -> None:
+        # Called with the GET Content-Length; only counts if the HEAD probe failed.
+        with self.lock:
+            if self._cuo_total == 0:
+                self._cuo_total = n
+                self.total += n
+
+    def reset(self) -> None:
+        with self.lock:
+            self.phase = ""
+            self.done = 0
+            self.total = 0
+            self.files = (0, 0)
+            self._cuo_total = 0
+        self.samples.clear()
+        self.fsamples.clear()
+
+    def snapshot(self):
+        with self.lock:
+            return self.phase, self.done, self.total, self.files
+
+
 class _StdoutQueue:
     """Redirects print() output from worker threads into the UI log."""
 
@@ -362,7 +454,10 @@ def run_gui(args) -> int:
     sys.stdout = _StdoutQueue(log_q)
     sys.stderr = _StdoutQueue(log_q)
 
-    state = {"cuo_exe": None, "settings_path": None, "email": "", "password": None}
+    state = {"cuo_exe": None, "settings_path": None, "email": "", "password": None,
+             "setup_running": False}
+    prog = _SetupProgress()
+    uo_patcher.progress_hook = prog.hook
 
     # ----- header -----
     tk.Label(root, text="HEX", font=("Georgia", 40, "bold"), fg=ACCENT, bg=BG).pack(pady=(18, 0))
@@ -377,12 +472,10 @@ def run_gui(args) -> int:
     def set_status(msg: str) -> None:
         root.after(0, status_var.set, msg)
 
-    # Technical output goes to a quiet log file for support -- no UI for it,
-    # except download-progress lines, which drive the progress bar below.
+    # Technical output goes to a quiet log file for support -- no UI for it.
+    # The progress bar is driven by _SetupProgress (polled below), not by
+    # parsing log lines.
     log_file = Path.home() / ".hexuo-launcher.log"
-
-    _patch_progress = re.compile(r"\[(\d+)/(\d+) files\] \[([\d.]+)/([\d.]+) MB\] \[([\d.]+)%\]")
-    _cuo_progress = re.compile(r"^\s*(\d{1,3})%\s*$")
 
     def pump_log() -> None:
         lines = []
@@ -392,23 +485,6 @@ def run_gui(args) -> int:
         except queue.Empty:
             pass
         if lines:
-            for line in lines:
-                m = _patch_progress.search(line)
-                if m:
-                    total_mb = float(m.group(4))
-                    if total_mb <= 0:
-                        status_var.set("Verifying game files ...")
-                        show_busy()
-                        continue
-                    set_progress(float(m.group(5)))
-                    status_var.set(
-                        f"Downloading game files -- {float(m.group(3)):.0f} of {total_mb:.0f} MB ({float(m.group(5)):.0f}%)"
-                    )
-                    continue
-                m = _cuo_progress.match(line)
-                if m:
-                    set_progress(int(m.group(1)))
-                    status_var.set(f"Downloading the game client -- {m.group(1)}%")
             try:
                 with open(log_file, "a", encoding="utf-8") as f:
                     f.write("\n".join(lines) + "\n")
@@ -484,14 +560,19 @@ def run_gui(args) -> int:
     play_btn.pack(pady=(0, 18), ipadx=30, ipady=6)
 
     # ----- progress bar -----
-    # Two modes: an indeterminate "working" sweep while checking/verifying (no byte
-    # counts yet), and a real percentage bar once downloads report progress.
+    # An indeterminate "working" sweep only while the totals are still unknown
+    # (contacting the patch server); a single real 0-100% bar for everything
+    # after that, with speed and time-remaining on the detail line below it.
     progress_bar = ttk.Progressbar(root, mode="determinate", maximum=100)
+    detail_var = tk.StringVar(value="")
+    detail_label = tk.Label(root, textvariable=detail_var, font=("Georgia", 11),
+                            fg=DIM, bg=BG)
     _progress_state = ["hidden"]  # hidden | busy | determinate
 
     def _ensure_shown() -> None:
         if _progress_state[0] == "hidden":
-            progress_bar.pack(fill="x", padx=40, pady=(0, 8), before=play_btn)
+            progress_bar.pack(fill="x", padx=40, pady=(0, 2), before=play_btn)
+            detail_label.pack(pady=(0, 8), before=play_btn)
 
     def show_busy() -> None:
         _ensure_shown()
@@ -512,7 +593,73 @@ def run_gui(args) -> int:
         if _progress_state[0] != "hidden":
             progress_bar.stop()
             progress_bar.pack_forget()
+            detail_label.pack_forget()
+            detail_var.set("")
             _progress_state[0] = "hidden"
+
+    # ----- live progress: one overall bar + speed + time remaining -----
+    _DOWNLOAD_PHASES = ("Downloading game files", "Downloading the game client")
+    _SLOW_PHASES = ("Scanning existing game files", "Assembling game archives",
+                    "Verifying game files", "Unpacking the game client")
+
+    def _fmt_eta(sec: float) -> str:
+        sec = int(sec)
+        if sec >= 3600:
+            return f"{sec // 3600}h {sec % 3600 // 60}m"
+        if sec >= 60:
+            return f"{sec // 60}m {sec % 60:02d}s"
+        return f"{sec}s"
+
+    def poll_progress() -> None:
+        if state["setup_running"]:
+            phase, done, total, (f_done, f_total) = prog.snapshot()
+            now = time.monotonic()
+            prog.samples.append((now, done))
+            while prog.samples and now - prog.samples[0][0] > 12:
+                prog.samples.popleft()
+
+            if phase in _DOWNLOAD_PHASES and total > 0:
+                shown = min(done, total)
+                pct = shown / total * 100
+                set_progress(pct)
+                status_var.set(f"{phase} -- {shown / 1048576:,.0f} of "
+                               f"{total / 1048576:,.0f} MB ({pct:.0f}%)")
+                if f_total > 0 and f_done < f_total:
+                    # Tiny-file stretch: a files-done rate is the honest unit
+                    # (byte speed reads near-zero even when it's going fast).
+                    # Wider window than the byte-speed one: per-file rates vary
+                    # a lot second-to-second, and a twitchy ETA reads as broken.
+                    prog.fsamples.append((now, f_done))
+                    while prog.fsamples and now - prog.fsamples[0][0] > 30:
+                        prog.fsamples.popleft()
+                    ft0, ff0 = prog.fsamples[0]
+                    if now - ft0 >= 1.0 and f_done > ff0:
+                        frate = (f_done - ff0) / (now - ft0)
+                        detail_var.set(f"{f_done:,} of {f_total:,} small files · "
+                                       f"about {_fmt_eta((f_total - f_done) / frate)} left")
+                    else:
+                        detail_var.set(f"{f_done:,} of {f_total:,} small files")
+                else:
+                    prog.fsamples.clear()
+                    t0, b0 = prog.samples[0]
+                    if now - t0 >= 1.0 and done > b0:
+                        speed = (done - b0) / (now - t0)
+                        remaining = max(total - done, 0)
+                        detail_var.set(f"{speed / 1048576:.1f} MB/s · "
+                                       f"about {_fmt_eta(remaining / speed)} left")
+                    else:
+                        detail_var.set("")
+            elif phase:
+                status_var.set(phase + " ...")
+                if total > 0:
+                    set_progress(min(done, total) / total * 100)
+                else:
+                    show_busy()
+                detail_var.set("This can take a minute -- the bar holds still here."
+                               if phase in _SLOW_PHASES else "")
+        root.after(250, poll_progress)
+
+    poll_progress()
 
     def busy(b: bool) -> None:
         action_btn.configure(state="disabled" if b else "normal")
@@ -743,16 +890,25 @@ def run_gui(args) -> int:
 
             set_status("Checking game files -- first install downloads ~1.6 GB ...")
             root.after(0, show_busy)
+
+            # Fold the client zip into the grand total up front, so the bar
+            # covers the entire setup and only ever reaches 100% once.
+            if args.update_cuo or find_cuo_executable(cuo_dir) is None:
+                asset = CUO_ASSETS.get(platform.system())
+                if asset:
+                    size = _remote_size(CUO_DOWNLOAD.format(asset=asset))
+                    if size:
+                        prog.add_cuo_total(size)
+
             ensure_game_files(client_dir, skip=args.skip_patch)
-            set_status("Checking the game client ...")
-            root.after(0, show_busy)
-            cuo_exe = ensure_classicuo(cuo_dir, force=args.update_cuo)
+            cuo_exe = ensure_classicuo(cuo_dir, force=args.update_cuo, progress=prog)
             settings_path = write_settings(cuo_exe, client_dir)
 
             state["cuo_exe"] = cuo_exe
             state["settings_path"] = settings_path
 
             def finish():
+                state["setup_running"] = False
                 hide_progress()
                 if saved_username(settings_path):
                     account_done()
@@ -761,12 +917,15 @@ def run_gui(args) -> int:
 
             root.after(0, finish)
         except Exception as exc:  # noqa: BLE001 -- show players a message, not a traceback
+            state["setup_running"] = False
             print(f"[!] {exc}")
             set_status(f"Something went wrong: {exc} -- ask for help at {WEBSITE}.")
 
     def begin_setup(root_dir: Path) -> None:
         install_panel.pack_forget()
         save_root(root_dir)
+        prog.reset()
+        state["setup_running"] = True
         threading.Thread(target=setup, args=(root_dir,), daemon=True).start()
 
     install_btn.configure(command=lambda: begin_setup(Path(path_var.get())))
