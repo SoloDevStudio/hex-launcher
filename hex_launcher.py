@@ -118,21 +118,31 @@ def ensure_game_files(client_dir: Path, skip: bool) -> None:
 # Step 2: ClassicUO
 # ---------------------------------------------------------------------------
 
-def _download_with_progress(url: str, dest: Path) -> None:
-    req = urllib.request.Request(url, headers={"User-Agent": "HexLauncher/1.0"})
-    with urllib.request.urlopen(req) as resp, open(dest, "wb") as out:
-        total = int(resp.headers.get("Content-Length") or 0)
-        done = 0
-        next_mark = 10
-        while True:
-            chunk = resp.read(1 << 16)
-            if not chunk:
-                break
-            out.write(chunk)
-            done += len(chunk)
-            if total and done * 100 // total >= next_mark:
-                print(f"    {done * 100 // total}%")
-                next_mark += 10
+def _download_with_progress(url: str, dest: Path, attempts: int = 3) -> None:
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "HexLauncher/1.0"})
+            # timeout guards against a stalled connection hanging setup forever.
+            with urllib.request.urlopen(req, timeout=30) as resp, open(dest, "wb") as out:
+                total = int(resp.headers.get("Content-Length") or 0)
+                done = 0
+                next_mark = 10
+                while True:
+                    chunk = resp.read(1 << 16)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    done += len(chunk)
+                    if total and done * 100 // total >= next_mark:
+                        print(f"    {done * 100 // total}%")
+                        next_mark += 10
+            return
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            print(f"[!] Download attempt {attempt} failed: {e}")
+            dest.unlink(missing_ok=True)
+    raise RuntimeError(f"Could not download after {attempts} tries: {last_err}")
 
 
 def find_cuo_executable(cuo_dir: Path) -> Path | None:
@@ -385,9 +395,13 @@ def run_gui(args) -> int:
             for line in lines:
                 m = _patch_progress.search(line)
                 if m:
+                    total_mb = float(m.group(4))
+                    if total_mb <= 0:
+                        status_var.set("Verifying game files ...")
+                        continue
                     set_progress(float(m.group(5)))
                     status_var.set(
-                        f"Downloading game files -- {float(m.group(3)):.0f} of {float(m.group(4)):.0f} MB ({float(m.group(5)):.0f}%)"
+                        f"Downloading game files -- {float(m.group(3)):.0f} of {total_mb:.0f} MB ({float(m.group(5)):.0f}%)"
                     )
                     continue
                 m = _cuo_progress.match(line)
@@ -653,7 +667,38 @@ def run_gui(args) -> int:
 
     def do_play() -> None:
         launch(state["cuo_exe"])
-        root.after(1200, root.destroy)
+        root.after(1200, on_close)
+
+    def do_uninstall() -> None:
+        from tkinter import messagebox
+        import shutil
+
+        target = state.get("settings_path")
+        root_dir = load_saved_root() or (Path(args.dir).expanduser() if args.dir else None)
+        if root_dir is None and target is not None:
+            root_dir = Path(target).parent.parent
+        if root_dir is None:
+            set_status("Nothing to uninstall.")
+            return
+
+        if not messagebox.askyesno(
+            "Uninstall Hex",
+            f"Delete the game and all downloaded files?\n\n{root_dir}\n\nYour account stays safe on the server.",
+        ):
+            return
+
+        try:
+            shutil.rmtree(root_dir, ignore_errors=True)
+            _launcher_config_path().unlink(missing_ok=True)
+            (Path.home() / ".hexuo-launcher.log").unlink(missing_ok=True)
+        finally:
+            on_close()
+
+    uninstall_btn = tk.Button(root, text="Uninstall", command=do_uninstall,
+                              font=("Georgia", 9), fg=DIM, bg=BG, bd=0,
+                              activebackground=BG, activeforeground=FG,
+                              highlightthickness=0, cursor="hand2")
+    uninstall_btn.pack(side="bottom", pady=(0, 4))
 
     play_btn.configure(command=do_play)
 
@@ -692,8 +737,20 @@ def run_gui(args) -> int:
 
     install_btn.configure(command=lambda: begin_setup(Path(path_var.get())))
 
+    def on_close() -> None:
+        root.destroy()
+        os._exit(0)  # downloader worker threads must never keep the process alive
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+
     preset = Path(args.dir).expanduser() if args.dir else load_saved_root()
-    if preset:
+    if preset and not args.dir and not preset.exists():
+        # The remembered folder is gone (moved drive, manual delete) --
+        # ask again instead of silently reinstalling into the old path.
+        set_status("Your old install folder is gone. Pick where to install.")
+        path_var.set(str(preset))
+        install_panel.pack(fill="x", pady=(0, 4), before=play_btn)
+    elif preset:
         begin_setup(preset)
     else:
         set_status("Pick an install folder to get started.")
@@ -807,6 +864,13 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # PyInstaller --windowed apps have no console: stdout/stderr are None on
+    # Windows and any stray print() would crash invisibly. Give them a sink.
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
     try:
         code = main()
     except KeyboardInterrupt:
