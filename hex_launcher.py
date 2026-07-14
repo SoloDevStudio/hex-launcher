@@ -398,6 +398,7 @@ def run_gui(args) -> int:
                     total_mb = float(m.group(4))
                     if total_mb <= 0:
                         status_var.set("Verifying game files ...")
+                        show_busy()
                         continue
                     set_progress(float(m.group(5)))
                     status_var.set(
@@ -482,20 +483,36 @@ def run_gui(args) -> int:
     play_btn = ttk.Button(root, text="▶  PLAY", state="disabled")
     play_btn.pack(pady=(0, 18), ipadx=30, ipady=6)
 
-    # ----- download progress bar (appears only while downloading) -----
+    # ----- progress bar -----
+    # Two modes: an indeterminate "working" sweep while checking/verifying (no byte
+    # counts yet), and a real percentage bar once downloads report progress.
     progress_bar = ttk.Progressbar(root, mode="determinate", maximum=100)
-    _progress_shown = [False]
+    _progress_state = ["hidden"]  # hidden | busy | determinate
+
+    def _ensure_shown() -> None:
+        if _progress_state[0] == "hidden":
+            progress_bar.pack(fill="x", padx=40, pady=(0, 8), before=play_btn)
+
+    def show_busy() -> None:
+        _ensure_shown()
+        if _progress_state[0] != "busy":
+            progress_bar.configure(mode="indeterminate")
+            progress_bar.start(12)
+            _progress_state[0] = "busy"
 
     def set_progress(pct) -> None:
-        if not _progress_shown[0]:
-            progress_bar.pack(fill="x", padx=40, pady=(0, 8), before=play_btn)
-            _progress_shown[0] = True
+        _ensure_shown()
+        if _progress_state[0] != "determinate":
+            progress_bar.stop()
+            progress_bar.configure(mode="determinate")
+            _progress_state[0] = "determinate"
         progress_bar["value"] = pct
 
     def hide_progress() -> None:
-        if _progress_shown[0]:
+        if _progress_state[0] != "hidden":
+            progress_bar.stop()
             progress_bar.pack_forget()
-            _progress_shown[0] = False
+            _progress_state[0] = "hidden"
 
     def busy(b: bool) -> None:
         action_btn.configure(state="disabled" if b else "normal")
@@ -725,8 +742,10 @@ def run_gui(args) -> int:
             print(f"[*] Install folder: {root_dir}")
 
             set_status("Checking game files -- first install downloads ~1.6 GB ...")
+            root.after(0, show_busy)
             ensure_game_files(client_dir, skip=args.skip_patch)
             set_status("Checking the game client ...")
+            root.after(0, show_busy)
             cuo_exe = ensure_classicuo(cuo_dir, force=args.update_cuo)
             settings_path = write_settings(cuo_exe, client_dir)
 
