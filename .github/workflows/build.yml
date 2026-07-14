@@ -17,7 +17,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install pyinstaller
-      - run: pyinstaller --onefile --console --name HexLauncher hex_launcher.py
+      - run: pyinstaller --onefile --windowed --name HexLauncher hex_launcher.py
       - uses: actions/upload-artifact@v4
         with:
           name: HexLauncher-windows
@@ -35,7 +35,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install pyinstaller
-      - run: pyinstaller --onefile --console --name HexLauncher hex_launcher.py
+      - run: pyinstaller --onefile --windowed --name HexLauncher hex_launcher.py
       - run: mv dist/HexLauncher dist/HexLauncher-mac
       - uses: actions/upload-artifact@v4
         with:
@@ -54,7 +54,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install pyinstaller
-      - run: pyinstaller --onefile --console --name HexLauncher hex_launcher.py
+      - run: pyinstaller --onefile --windowed --name HexLauncher hex_launcher.py
       - run: mv dist/HexLauncher dist/HexLauncher-linux
       - uses: actions/upload-artifact@v4
         with:
