@@ -45,3 +45,22 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: dist/HexLauncher-mac
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyinstaller
+      - run: pyinstaller --onefile --console --name HexLauncher hex_launcher.py
+      - run: mv dist/HexLauncher dist/HexLauncher-linux
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HexLauncher-linux
+          path: dist/HexLauncher-linux
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dist/HexLauncher-linux
