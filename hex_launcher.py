@@ -700,6 +700,21 @@ def run_gui(args) -> int:
                               highlightthickness=0, cursor="hand2")
     uninstall_btn.pack(side="bottom", pady=(0, 4))
 
+    # Always-available: repoint the install folder at any time, not just first run.
+    def change_folder() -> None:
+        acct.pack_forget()
+        play_btn.configure(state="disabled")
+        current = load_saved_root() or install_root(args.dir)
+        path_var.set(str(current))
+        install_panel.pack(fill="x", pady=(0, 4), before=play_btn)
+        set_status("Choose where Hex should live, then Install here.")
+
+    change_folder_btn = tk.Button(root, text="Change install folder", command=change_folder,
+                                  font=("Georgia", 9), fg=DIM, bg=BG, bd=0,
+                                  activebackground=BG, activeforeground=FG,
+                                  highlightthickness=0, cursor="hand2")
+    change_folder_btn.pack(side="bottom", pady=(0, 2))
+
     play_btn.configure(command=do_play)
 
     # ----- background setup -----
