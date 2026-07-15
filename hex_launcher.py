@@ -748,7 +748,7 @@ def run_gui(args) -> int:
                     set_progress(min(done, total) / total * 100)
                 else:
                     show_busy()
-                detail_var.set("This can take a minute -- the bar holds still here."
+                detail_var.set("This can take a few minutes -- the bar holds still here."
                                if phase in _SLOW_PHASES else "")
         root.after(250, poll_progress)
 
