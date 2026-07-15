@@ -16,6 +16,10 @@ What it does, in order:
 
 Re-running the launcher verifies/updates everything and plays again --
 it is the patcher from then on. Your saved login is never overwritten.
+
+A quiet "Server:" toggle at the bottom of the window switches between the live
+Hex shard and the Hex Beta shard (separate accounts and characters); the choice
+is remembered, and --server hex|beta forces it for a single run.
 """
 
 from __future__ import annotations
@@ -44,10 +48,55 @@ import uo_patcher
 
 SHARD_NAME = "Hex"
 WEBSITE = "uohex.com"
-# HEX_SERVER / HEX_PORT / HEX_API env vars override the shard endpoints (dev/test use).
-SERVER_HOST = os.environ.get("HEX_SERVER", "play.uohex.com")
-SERVER_PORT = int(os.environ.get("HEX_PORT", "2593"))
-API_URL = os.environ.get("HEX_API", f"https://{WEBSITE}/api")
+
+# Endpoint profiles: the launcher can point at the live shard or the beta shard.
+# Each profile is (display name, server host, server port, account-API base URL).
+PROFILES = {
+    "hex":  (SHARD_NAME, "play.uohex.com", 2593, f"https://{WEBSITE}/api"),
+    "beta": ("Hex Beta", "beta-play.uohex.com", 2594, f"https://{WEBSITE}/api-beta"),
+}
+DEFAULT_SERVER = "hex"
+
+# The active profile key. Module-level so the console path and the GUI's server
+# picker share it; every endpoint reader below resolves it at CALL time, so
+# toggling the picker takes effect immediately for later API calls and PLAY.
+_active_server = DEFAULT_SERVER
+
+
+def set_active_server(key: str | None) -> None:
+    global _active_server
+    _active_server = key if key in PROFILES else DEFAULT_SERVER
+
+
+def active_server() -> str:
+    return _active_server
+
+
+# HEX_SERVER / HEX_PORT / HEX_API env vars override the active profile's
+# endpoints (dev/test use) -- they win regardless of which profile is active.
+_ENV_HOST = os.environ.get("HEX_SERVER")
+_ENV_PORT = os.environ.get("HEX_PORT")
+_ENV_API = os.environ.get("HEX_API")
+# HEX_INVITE, if set, is sent automatically as the beta invite code (dev/test use).
+INVITE_CODE = os.environ.get("HEX_INVITE", "")
+
+
+def server_name() -> str:
+    return PROFILES[_active_server][0]
+
+
+def server_host() -> str:
+    return _ENV_HOST or PROFILES[_active_server][1]
+
+
+def server_port() -> int:
+    return int(_ENV_PORT) if _ENV_PORT else PROFILES[_active_server][2]
+
+
+def api_url() -> str:
+    return _ENV_API or PROFILES[_active_server][3]
+
+
 CLIENT_VERSION = "7.0.116.0"
 
 # Hex's own client build (email accounts on the login screen, 30-char fields),
@@ -84,21 +133,41 @@ def _launcher_config_path() -> Path:
     return Path.home() / ".hexuo-launcher.json"
 
 
-def load_saved_root() -> Path | None:
+def _load_config() -> dict:
     try:
-        saved = json.loads(_launcher_config_path().read_text(encoding="utf-8")).get("install_root")
-        return Path(saved) if saved else None
+        data = json.loads(_launcher_config_path().read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
     except (OSError, json.JSONDecodeError):
-        return None
+        return {}
+
+
+def _save_config(**updates) -> None:
+    # Merge into whatever is already there so we never clobber sibling keys
+    # (install_root, server, or anything a future version adds).
+    data = _load_config()
+    data.update(updates)
+    try:
+        _launcher_config_path().write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except OSError:
+        pass  # non-fatal: worst case a picker shows again next run
+
+
+def load_saved_root() -> Path | None:
+    saved = _load_config().get("install_root")
+    return Path(saved) if saved else None
 
 
 def save_root(root: Path) -> None:
-    try:
-        _launcher_config_path().write_text(
-            json.dumps({"install_root": str(root)}, indent=2), encoding="utf-8"
-        )
-    except OSError:
-        pass  # non-fatal: worst case the picker shows again next run
+    _save_config(install_root=str(root))
+
+
+def load_saved_server() -> str:
+    key = _load_config().get("server")
+    return key if key in PROFILES else DEFAULT_SERVER
+
+
+def save_server(key: str) -> None:
+    _save_config(server=key if key in PROFILES else DEFAULT_SERVER)
 
 
 # ---------------------------------------------------------------------------
@@ -239,11 +308,11 @@ def write_settings(cuo_exe: Path, client_dir: Path) -> Path:
     settings.setdefault("encryption", 0)
     settings.update(
         {
-            "ip": SERVER_HOST,
-            "port": SERVER_PORT,
+            "ip": server_host(),
+            "port": server_port(),
             "ultimaonlinedirectory": str(client_dir),
             "clientversion": CLIENT_VERSION,
-            "last_server_name": SHARD_NAME,
+            "last_server_name": server_name(),
         }
     )
 
@@ -310,7 +379,7 @@ def saved_username(settings_path: Path) -> str:
 
 def _api_post(endpoint: str, payload: dict) -> dict:
     req = urllib.request.Request(
-        f"{API_URL}{endpoint}",
+        f"{api_url()}{endpoint}",
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json", "User-Agent": "HexLauncher/1.0"},
         method="POST",
@@ -337,7 +406,7 @@ def _looks_like_email(s: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def launch(cuo_exe: Path) -> None:
-    print(f"\n[*] Launching {SHARD_NAME} ...")
+    print(f"\n[*] Launching {server_name()} ...")
     cmd = [str(cuo_exe)]
     # With saved credentials, skip the classic login screen entirely.
     try:
@@ -436,6 +505,7 @@ def run_gui(args) -> int:
     from tkinter import ttk
 
     BG, PANEL, FG, ACCENT, DIM = "#161219", "#221b26", "#e8e0d8", "#c9a227", "#8a8078"
+    BETA_ACCENT = "#8fbf6f"  # colder green-gold -- signals "you're on the beta shard"
 
     root = tk.Tk()
     root.title(f"{SHARD_NAME} Launcher — {WEBSITE}")
@@ -454,13 +524,14 @@ def run_gui(args) -> int:
     sys.stdout = _StdoutQueue(log_q)
     sys.stderr = _StdoutQueue(log_q)
 
-    state = {"cuo_exe": None, "settings_path": None, "email": "", "password": None,
-             "setup_running": False}
+    state = {"cuo_exe": None, "client_dir": None, "settings_path": None,
+             "email": "", "password": None, "setup_running": False}
     prog = _SetupProgress()
     uo_patcher.progress_hook = prog.hook
 
     # ----- header -----
-    tk.Label(root, text="HEX", font=("Georgia", 40, "bold"), fg=ACCENT, bg=BG).pack(pady=(18, 0))
+    header_label = tk.Label(root, text="HEX", font=("Georgia", 40, "bold"), fg=ACCENT, bg=BG)
+    header_label.pack(pady=(18, 0))
     tk.Label(root, text=f"{WEBSITE}  ·  Ultima Online, Renaissance era", font=("Georgia", 13),
              fg=DIM, bg=BG).pack()
 
@@ -512,6 +583,7 @@ def run_gui(args) -> int:
     email_box, _, email_e = field(signup_frame, "Email address (this is your account name)")
     pw_box, pw_label, pw_e = field(signup_frame, "Choose a password", show="●")
     pw2_box, pw2_label, pw2_e = field(signup_frame, "Type the password again", show="●")
+    invite_box, _, invite_e = field(signup_frame, "Invite code (leave blank if none)")
 
     verify_frame = tk.Frame(acct, bg=BG)
     _, code_label, code_e = field(verify_frame, "6-digit code from your inbox")
@@ -669,7 +741,7 @@ def run_gui(args) -> int:
         verify_frame.pack_forget()
         signup_frame.pack_forget()
         forgot_btn.pack_forget()
-        for box in (email_box, pw_box, pw2_box):
+        for box in (email_box, pw_box, pw2_box, invite_box):
             box.pack_forget()
 
     def _show_acct() -> None:
@@ -682,6 +754,7 @@ def run_gui(args) -> int:
         email_box.pack(fill="x")
         pw_box.pack(fill="x")
         pw2_box.pack(fill="x")
+        invite_box.pack(fill="x")
         signup_frame.pack(fill="x")
         _show_acct()
         action_btn.configure(text="Create Account", command=do_signup)
@@ -767,6 +840,7 @@ def run_gui(args) -> int:
             return
         state["email"] = email
         state["password"] = pw
+        invite = INVITE_CODE or invite_e.get().strip()
 
         def ok(_):
             show_verify()
@@ -776,7 +850,10 @@ def run_gui(args) -> int:
                 save_login(state["settings_path"], email, pw)
                 account_done()
 
-        api_call("/signup", {"email": email, "password": pw}, ok, fail)
+        payload = {"email": email, "password": pw}
+        if invite:
+            payload["inviteCode"] = invite
+        api_call("/signup", payload, ok, fail)
 
     def do_verify() -> None:
         code = code_e.get().strip()
@@ -830,6 +907,10 @@ def run_gui(args) -> int:
         api_call("/reset", {"email": state["email"], "code": code, "newPassword": pw}, ok)
 
     def do_play() -> None:
+        # Re-pin settings.json to the active profile's host/port before launch --
+        # the server picker may have changed the shard since setup wrote it.
+        if state.get("cuo_exe") and state.get("client_dir"):
+            write_settings(state["cuo_exe"], state["client_dir"])
         launch(state["cuo_exe"])
         root.after(1200, on_close)
 
@@ -879,6 +960,37 @@ def run_gui(args) -> int:
                                   highlightthickness=0, cursor="hand2")
     change_folder_btn.pack(side="bottom", pady=(0, 2))
 
+    # ----- server picker (always visible; toggles live shard <-> beta) -----
+    def _refresh_server_ui() -> None:
+        beta = active_server() == "beta"
+        server_btn.configure(text=f"Server: {server_name()}")
+        header_label.configure(text="HEX BETA" if beta else "HEX",
+                               fg=BETA_ACCENT if beta else ACCENT)
+        root.title(f"Hex Launcher — BETA — {WEBSITE}" if beta
+                   else f"{SHARD_NAME} Launcher — {WEBSITE}")
+
+    def toggle_server() -> None:
+        new = "beta" if active_server() == "hex" else "hex"
+        set_active_server(new)
+        save_server(new)
+        _refresh_server_ui()
+        # settings.json is one shared file, so the username saved in it may
+        # belong to the other shard. If setup already finished, make the player
+        # consciously log in for the shard they just picked (their saved creds
+        # stay in the fields -- same creds is one press of Log In). Host/port are
+        # re-pinned to the active profile at PLAY time (do_play -> write_settings).
+        if state.get("settings_path"):
+            show_existing()
+            if new == "beta":
+                set_status("Connected to the BETA shard — separate accounts and characters.")
+
+    server_btn = tk.Button(root, text=f"Server: {server_name()}", command=toggle_server,
+                           font=("Georgia", 9), fg=DIM, bg=BG, bd=0,
+                           activebackground=BG, activeforeground=FG,
+                           highlightthickness=0, cursor="hand2")
+    server_btn.pack(side="bottom", pady=(0, 2))
+    _refresh_server_ui()
+
     play_btn.configure(command=do_play)
 
     # ----- background setup -----
@@ -905,6 +1017,7 @@ def run_gui(args) -> int:
             settings_path = write_settings(cuo_exe, client_dir)
 
             state["cuo_exe"] = cuo_exe
+            state["client_dir"] = client_dir
             state["settings_path"] = settings_path
 
             def finish():
@@ -964,7 +1077,7 @@ def ensure_account_console(settings_path: Path) -> None:
 
     import getpass
 
-    print(f"\n=== Set up your {SHARD_NAME} account ===")
+    print(f"\n=== Set up your {server_name()} account ===")
     print("    Your EMAIL ADDRESS is your account name.\n")
 
     if input("    Already have an account? [y/N] ").strip().lower() == "y":
@@ -988,7 +1101,12 @@ def ensure_account_console(settings_path: Path) -> None:
             break
         print("    Passwords don't match (or were empty) -- try again.")
 
-    result = _api_post("/signup", {"email": email, "password": pw})
+    invite = INVITE_CODE or input("    Invite code (Enter if none): ").strip()
+
+    payload = {"email": email, "password": pw}
+    if invite:
+        payload["inviteCode"] = invite
+    result = _api_post("/signup", payload)
     print(f"    {result.get('message', '')}")
     if not result.get("ok"):
         if "already exists" in result.get("message", ""):
@@ -1037,8 +1155,14 @@ def main() -> int:
     parser.add_argument("--update-cuo", action="store_true", help="force re-download of ClassicUO")
     parser.add_argument("--no-play", action="store_true", help="install/update only, don't launch")
     parser.add_argument("--console", action="store_true", help="text mode instead of the window")
+    parser.add_argument("--server", choices=("hex", "beta"),
+                        help="which shard to use (overrides the saved choice; saves nothing)")
     parser.add_argument("--signup-test", metavar="SETTINGS", help=argparse.SUPPRESS)  # dev only
     args = parser.parse_args()
+
+    # Active shard: an explicit --server wins and is not persisted; otherwise
+    # honor the saved choice from the launcher config.
+    set_active_server(args.server if args.server else load_saved_server())
 
     if args.signup_test:
         ensure_account_console(Path(args.signup_test).expanduser())
