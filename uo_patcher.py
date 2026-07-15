@@ -121,6 +121,8 @@ def log(msg):
 #   ('phase', str)  -- human-readable step name
 #   ('total', int)  -- add N bytes to the grand download total (may be negative)
 #   ('bytes', int)  -- N more bytes downloaded/verified (negative rolls back a failed attempt)
+#   ('files', (done, total))  -- tiny-file stretch progress (files, not bytes)
+#   ('files_planned', int)    -- tiny-file stretch still ahead: N entries queued
 progress_hook = None
 
 
@@ -867,9 +869,13 @@ def run_patch(output_dir, prod_url=None, workers=8, dry_run=False, no_verify=Fal
     # so count only the residue up front. If a .uop later fails its signature
     # check, the difference is added back at filter time below.
     unpacked_uop_names = set(e['name'] for e in all_unpacked if e['name'].endswith('.uop'))
-    expected_pack_bytes = sum(_dl_size(e) for e in all_packs
-                              if e['pack_name'] not in unpacked_uop_names)
+    expected_packs = [e for e in all_packs if e['pack_name'] not in unpacked_uop_names]
+    expected_pack_bytes = sum(_dl_size(e) for e in expected_packs)
     _emit('total', total_unpacked_bytes + expected_pack_bytes)
+    # Announce the latency-bound tiny-file stretch up front so the GUI's ETA
+    # during the big unpacked downloads doesn't promise "2s left" while tens of
+    # thousands of small files still wait their turn.
+    _emit('files_planned', len(expected_packs))
 
     log(f"\n{'='*60}")
     log(f"[*] Total unpacked files: {len(all_unpacked)}")
@@ -916,6 +922,7 @@ def run_patch(output_dir, prod_url=None, workers=8, dry_run=False, no_verify=Fal
     kept_pack_bytes = sum(_dl_size(e) for e in all_packs)
     if kept_pack_bytes != expected_pack_bytes:
         _emit('total', kept_pack_bytes - expected_pack_bytes)
+    _emit('files_planned', len(all_packs))
 
     # 5. Download remaining pack files with retry loop
     if all_packs:
@@ -926,8 +933,10 @@ def run_patch(output_dir, prod_url=None, workers=8, dry_run=False, no_verify=Fal
         if pack_index:
             log(f"  Found {len(pack_index)} existing entries in local archives")
 
-        # Tiny-file phase is latency-bound, not bandwidth-bound: use more threads.
-        pack_workers = min(workers * 2, 32)
+        # Tiny-file phase is latency-bound, not bandwidth-bound: per-request
+        # round-trips dominate, so files/s scales with connection count, and
+        # the ~3 KB bodies keep total bandwidth trivial even at the 32 cap.
+        pack_workers = min(workers * 4, 32)
         _emit('phase', 'Downloading game files')
         log(f"[*] Downloading {len(all_packs)} pack entries ({pack_workers} threads)...")
         failed_packs = download_packs_parallel(file_repo, all_packs, output_dir, pack_workers, pack_index)

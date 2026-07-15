@@ -435,7 +435,8 @@ class _SetupProgress:
         self.phase = ""
         self.done = 0
         self.total = 0
-        self.files = (0, 0)  # (done, total) for tiny-file phases
+        self.files = (0, 0)      # (done, total) for tiny-file phases
+        self.files_planned = 0   # tiny-file stretch not yet started: N queued
         self._cuo_total = 0
         # Sample deques are touched by the GUI thread only.
         self.samples: deque = deque()   # (monotonic_time, done_bytes)
@@ -452,6 +453,12 @@ class _SetupProgress:
                 self.done += int(value or 0)
             elif event == "files":
                 self.files = tuple(value) if value else (0, 0)
+                # Once the stretch has fully arrived, stop advertising it as
+                # "still ahead" (the ClassicUO download comes after it).
+                if self.files[1] > 0 and self.files[0] >= self.files[1]:
+                    self.files_planned = 0
+            elif event == "files_planned":
+                self.files_planned = int(value or 0)
 
     def set_phase(self, name: str) -> None:
         self.hook("phase", name)
@@ -477,13 +484,14 @@ class _SetupProgress:
             self.done = 0
             self.total = 0
             self.files = (0, 0)
+            self.files_planned = 0
             self._cuo_total = 0
         self.samples.clear()
         self.fsamples.clear()
 
     def snapshot(self):
         with self.lock:
-            return self.phase, self.done, self.total, self.files
+            return self.phase, self.done, self.total, self.files, self.files_planned
 
 
 class _StdoutQueue:
@@ -684,41 +692,54 @@ def run_gui(args) -> int:
 
     def poll_progress() -> None:
         if state["setup_running"]:
-            phase, done, total, (f_done, f_total) = prog.snapshot()
+            phase, done, total, (f_done, f_total), f_planned = prog.snapshot()
             now = time.monotonic()
             prog.samples.append((now, done))
             while prog.samples and now - prog.samples[0][0] > 12:
                 prog.samples.popleft()
 
             if phase in _DOWNLOAD_PHASES and total > 0:
-                shown = min(done, total)
-                pct = shown / total * 100
-                set_progress(pct)
-                status_var.set(f"{phase} -- {shown / 1048576:,.0f} of "
-                               f"{total / 1048576:,.0f} MB ({pct:.0f}%)")
                 if f_total > 0 and f_done < f_total:
-                    # Tiny-file stretch: a files-done rate is the honest unit
-                    # (byte speed reads near-zero even when it's going fast).
+                    # Tiny-file stretch: files-done is the honest unit for bar,
+                    # headline, and ETA alike -- the byte bar would sit at ~9x%
+                    # for minutes (latency-bound, not bandwidth-bound), and byte
+                    # speed reads near-zero even when it's going fast.
                     # Wider window than the byte-speed one: per-file rates vary
                     # a lot second-to-second, and a twitchy ETA reads as broken.
+                    fpct = f_done / f_total * 100
+                    set_progress(fpct)
+                    status_var.set(f"{phase} -- {f_done:,} of {f_total:,} "
+                                   f"small files ({fpct:.0f}%)")
                     prog.fsamples.append((now, f_done))
                     while prog.fsamples and now - prog.fsamples[0][0] > 30:
                         prog.fsamples.popleft()
                     ft0, ff0 = prog.fsamples[0]
                     if now - ft0 >= 1.0 and f_done > ff0:
                         frate = (f_done - ff0) / (now - ft0)
-                        detail_var.set(f"{f_done:,} of {f_total:,} small files · "
-                                       f"about {_fmt_eta((f_total - f_done) / frate)} left")
+                        detail_var.set(f"{frate:,.0f} files/s · about "
+                                       f"{_fmt_eta((f_total - f_done) / frate)} left")
                     else:
-                        detail_var.set(f"{f_done:,} of {f_total:,} small files")
+                        detail_var.set("")
                 else:
+                    shown = min(done, total)
+                    pct = shown / total * 100
+                    set_progress(pct)
+                    status_var.set(f"{phase} -- {shown / 1048576:,.0f} of "
+                                   f"{total / 1048576:,.0f} MB ({pct:.0f}%)")
                     prog.fsamples.clear()
                     t0, b0 = prog.samples[0]
                     if now - t0 >= 1.0 and done > b0:
                         speed = (done - b0) / (now - t0)
                         remaining = max(total - done, 0)
-                        detail_var.set(f"{speed / 1048576:.1f} MB/s · "
-                                       f"about {_fmt_eta(remaining / speed)} left")
+                        eta = _fmt_eta(remaining / speed)
+                        if f_planned > 0 and f_total == 0:
+                            # A latency-bound tiny-file stage still follows;
+                            # a bytes-only ETA would promise "2s left" here.
+                            detail_var.set(f"{speed / 1048576:.1f} MB/s · about "
+                                           f"{eta} left, then {f_planned:,} small files")
+                        else:
+                            detail_var.set(f"{speed / 1048576:.1f} MB/s · "
+                                           f"about {eta} left")
                     else:
                         detail_var.set("")
             elif phase:
