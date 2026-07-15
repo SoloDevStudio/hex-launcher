@@ -270,7 +270,17 @@ def ensure_classicuo(cuo_dir: Path, force: bool, progress=None) -> Path:
     if progress:
         progress.set_phase("Unpacking the game client")
     with zipfile.ZipFile(zip_path) as zf:
-        zf.extractall(cuo_dir)
+        members = zf.infolist()
+        if progress:
+            progress.hook("install_total", len(members))
+        done = 0
+        for member in members:
+            zf.extract(member, cuo_dir)
+            done += 1
+            if progress and done % 50 == 0:
+                progress.hook("install", 50)
+        if progress and done % 50:
+            progress.hook("install", done % 50)
     zip_path.unlink()
 
     exe = find_cuo_executable(cuo_dir)
@@ -423,11 +433,14 @@ def launch(cuo_exe: Path) -> None:
 # ---------------------------------------------------------------------------
 
 class _SetupProgress:
-    """Single source of truth for the setup progress bar.
+    """Single source of truth for both progress sections (Download/Install).
 
-    One grand byte total covers the whole install -- game files (fed by
-    uo_patcher's progress hook) plus the ClassicUO zip -- so the bar moves
-    0 -> 100% exactly once, with real speed and time-remaining.
+    One grand byte total covers the whole download side -- game files (fed by
+    uo_patcher's progress hook) plus the ClassicUO zip -- so that bar moves
+    0 -> 100% exactly once, with real speed and time-remaining. Separately,
+    inst/last_file track whichever slow local stage (Scanning/Assembling/
+    Verifying/Unpacking) is currently running, in that stage's own unit
+    (archives/chunks/files) instead of bytes.
     """
 
     def __init__(self):
@@ -437,6 +450,9 @@ class _SetupProgress:
         self.total = 0
         self.files = (0, 0)      # (done, total) for tiny-file phases
         self.files_planned = 0   # tiny-file stretch not yet started: N queued
+        self.inst = (0, 0)       # (done, total) for the current slow local stage
+        self.inst_name = ""      # what that stage is working on right now
+        self.last_file = ""      # most recently completed download, for the ticker
         self._cuo_total = 0
         # Sample deques are touched by the GUI thread only.
         self.samples: deque = deque()   # (monotonic_time, done_bytes)
@@ -447,6 +463,10 @@ class _SetupProgress:
             if event == "phase":
                 self.phase = value or ""
                 self.files = (0, 0)
+                # inst/last_file are deliberately NOT reset here -- each slow
+                # stage sets its own install_total when it begins, and the
+                # ticker should keep showing the last completed file across
+                # a phase change, not blank out between phases.
             elif event == "total":
                 self.total += int(value or 0)
             elif event == "bytes":
@@ -459,6 +479,19 @@ class _SetupProgress:
                     self.files_planned = 0
             elif event == "files_planned":
                 self.files_planned = int(value or 0)
+            elif event == "file":
+                self.last_file = value or ""
+            elif event == "install_total":
+                self.inst = (0, int(value or 0))
+                self.inst_name = ""  # each stage names its own work (or stays plain)
+            elif event == "install_name":
+                self.inst_name = value or ""
+            elif event == "install":
+                i_done, i_total = self.inst
+                i_done += int(value or 0)
+                if i_total > 0:
+                    i_done = min(i_done, i_total)
+                self.inst = (i_done, i_total)
 
     def set_phase(self, name: str) -> None:
         self.hook("phase", name)
@@ -485,13 +518,17 @@ class _SetupProgress:
             self.total = 0
             self.files = (0, 0)
             self.files_planned = 0
+            self.inst = (0, 0)
+            self.inst_name = ""
+            self.last_file = ""
             self._cuo_total = 0
         self.samples.clear()
         self.fsamples.clear()
 
     def snapshot(self):
         with self.lock:
-            return self.phase, self.done, self.total, self.files, self.files_planned
+            return (self.phase, self.done, self.total, self.files, self.files_planned,
+                    self.inst, self.inst_name, self.last_file)
 
 
 class _StdoutQueue:
@@ -639,20 +676,41 @@ def run_gui(args) -> int:
     play_btn = ttk.Button(root, text="▶  PLAY", state="disabled")
     play_btn.pack(pady=(0, 18), ipadx=30, ipady=6)
 
-    # ----- progress bar -----
-    # An indeterminate "working" sweep only while the totals are still unknown
-    # (contacting the patch server); a single real 0-100% bar for everything
-    # after that, with speed and time-remaining on the detail line below it.
-    progress_bar = ttk.Progressbar(root, mode="determinate", maximum=100)
+    # ----- progress: two sections (Download / Install), always shown together -----
+    # The classic patcher layout: Download keeps the byte/files bar, speed+ETA,
+    # and a ticker of recently finished files; Install gets its own bar for the
+    # slow local stages (Scanning/Assembling/Verifying/Unpacking), moving in
+    # that stage's own honest unit instead of freezing behind a caption.
+    dl_section = tk.Frame(root, bg=BG)
+    tk.Label(dl_section, text="Download", font=("Georgia", 10), fg=DIM, bg=BG,
+             anchor="w").pack(fill="x", padx=40)
+    progress_bar = ttk.Progressbar(dl_section, mode="determinate", maximum=100)
+    progress_bar.pack(fill="x", padx=40, pady=(0, 2))
     detail_var = tk.StringVar(value="")
-    detail_label = tk.Label(root, textvariable=detail_var, font=("Georgia", 11),
+    detail_label = tk.Label(dl_section, textvariable=detail_var, font=("Georgia", 11),
                             fg=DIM, bg=BG)
-    _progress_state = ["hidden"]  # hidden | busy | determinate
+    detail_label.pack(pady=(0, 2))
+    ticker_var = tk.StringVar(value="")
+    ticker_label = tk.Label(dl_section, textvariable=ticker_var, font=("Georgia", 9),
+                            fg=DIM, bg=BG)
+    ticker_label.pack(pady=(0, 8))
+
+    inst_section = tk.Frame(root, bg=BG)
+    tk.Label(inst_section, text="Install", font=("Georgia", 10), fg=DIM, bg=BG,
+             anchor="w").pack(fill="x", padx=40)
+    progress_bar2 = ttk.Progressbar(inst_section, mode="determinate", maximum=100)
+    progress_bar2.pack(fill="x", padx=40, pady=(0, 2))
+    detail2_var = tk.StringVar(value="")
+    detail_label2 = tk.Label(inst_section, textvariable=detail2_var, font=("Georgia", 11),
+                             fg=DIM, bg=BG)
+    detail_label2.pack(pady=(0, 8))
+
+    _progress_state = ["hidden"]  # hidden | busy | determinate -- bar 1 only; bar 2 has no busy mode
 
     def _ensure_shown() -> None:
         if _progress_state[0] == "hidden":
-            progress_bar.pack(fill="x", padx=40, pady=(0, 2), before=play_btn)
-            detail_label.pack(pady=(0, 8), before=play_btn)
+            dl_section.pack(fill="x", before=play_btn)
+            inst_section.pack(fill="x", before=play_btn)
 
     def show_busy() -> None:
         _ensure_shown()
@@ -669,18 +727,34 @@ def run_gui(args) -> int:
             _progress_state[0] = "determinate"
         progress_bar["value"] = pct
 
+    def set_install_progress(pct) -> None:
+        # No _ensure_shown() here: this runs every poll tick, and packing the
+        # sections outside the phase-driven paths would leave them visible-but
+        # -"hidden" (hide_progress guards on that state and would never fire).
+        progress_bar2["value"] = pct
+
     def hide_progress() -> None:
         if _progress_state[0] != "hidden":
             progress_bar.stop()
-            progress_bar.pack_forget()
-            detail_label.pack_forget()
+            progress_bar.configure(mode="determinate")
+            progress_bar["value"] = 0
+            progress_bar2["value"] = 0
+            dl_section.pack_forget()
+            inst_section.pack_forget()
             detail_var.set("")
+            ticker_var.set("")
+            detail2_var.set("")
             _progress_state[0] = "hidden"
 
-    # ----- live progress: one overall bar + speed + time remaining -----
+    # ----- live progress: download bar+speed+ETA+ticker, install bar+count -----
     _DOWNLOAD_PHASES = ("Downloading game files", "Downloading the game client")
-    _SLOW_PHASES = ("Scanning existing game files", "Assembling game archives",
-                    "Verifying game files", "Unpacking the game client")
+    # phase -> the unit word its Install detail line counts in
+    _SLOW_PHASES = {
+        "Scanning existing game files": "archives",
+        "Assembling game archives": "chunks",
+        "Verifying game files": "files",
+        "Unpacking the game client": "files",
+    }
 
     def _fmt_eta(sec: float) -> str:
         sec = int(sec)
@@ -692,11 +766,19 @@ def run_gui(args) -> int:
 
     def poll_progress() -> None:
         if state["setup_running"]:
-            phase, done, total, (f_done, f_total), f_planned = prog.snapshot()
+            (phase, done, total, (f_done, f_total), f_planned,
+             (i_done, i_total), inst_name, last_file) = prog.snapshot()
             now = time.monotonic()
             prog.samples.append((now, done))
             while prog.samples and now - prog.samples[0][0] > 12:
                 prog.samples.popleft()
+
+            # Install bar always tracks the latest install-unit state -- 0%
+            # before any local stage has run, frozen at its last value between
+            # stages (eg. Scanning -> back to a download phase for the pack
+            # chunks -> Assembling), moving for real once a slow phase is the
+            # active one below.
+            set_install_progress(i_done / i_total * 100 if i_total > 0 else 0)
 
             if phase in _DOWNLOAD_PHASES and total > 0:
                 if f_total > 0 and f_done < f_total:
@@ -742,14 +824,36 @@ def run_gui(args) -> int:
                                            f"about {eta} left")
                     else:
                         detail_var.set("")
+            elif phase in _SLOW_PHASES:
+                # Downloads are already done by the time a slow local stage
+                # starts -- hold the download bar full (unless a total was
+                # never even set) instead of freezing it mid-way, and let the
+                # install bar above do the moving now. No fresh bytes are
+                # moving here, so the old speed/ETA line would just go stale;
+                # blank it rather than leave the last download's reading up.
+                status_var.set(phase + " ...")
+                set_progress(100 if total <= 0 or done >= total else done / total * 100)
+                detail_var.set("")
+                unit = _SLOW_PHASES[phase]
+                if i_total > 0:
+                    count = f"{i_done:,} of {i_total:,} {unit}"
+                    detail2_var.set(f"{inst_name} · {count}" if inst_name else count)
+                else:
+                    detail2_var.set("")
             elif phase:
                 status_var.set(phase + " ...")
                 if total > 0:
                     set_progress(min(done, total) / total * 100)
                 else:
                     show_busy()
-                detail_var.set("This can take a few minutes -- the bar holds still here."
-                               if phase in _SLOW_PHASES else "")
+                detail_var.set("")
+
+            # Ticker: latest completed filename, dim marker, download phases
+            # only -- during install stages a frozen "↓ name" under the full
+            # Download bar reads as a stalled download. No extra animation;
+            # the natural churn at 250ms is the effect.
+            ticker_var.set(f"↓ {last_file}"
+                           if last_file and phase in _DOWNLOAD_PHASES else "")
         root.after(250, poll_progress)
 
     poll_progress()

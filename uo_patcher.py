@@ -123,6 +123,10 @@ def log(msg):
 #   ('bytes', int)  -- N more bytes downloaded/verified (negative rolls back a failed attempt)
 #   ('files', (done, total))  -- tiny-file stretch progress (files, not bytes)
 #   ('files_planned', int)    -- tiny-file stretch still ahead: N entries queued
+#   ('file', str)             -- a named download just completed (ticker feed)
+#   ('install_total', int)    -- a slow local stage begins: reset install progress to 0/N
+#   ('install', int)          -- N more install units done (additive)
+#   ('install_name', str)     -- what the install stage is working on right now
 progress_hook = None
 
 
@@ -473,6 +477,7 @@ def _download_one_unpacked(file_repo, entry, output_dir):
             pass  # fall through to re-download
         else:
             _emit('bytes', _dl_size(entry))
+            _emit('file', name)
             return (entry, None, True)  # (entry, error, was_skipped)
 
     h = filename_hash(name)
@@ -486,6 +491,7 @@ def _download_one_unpacked(file_repo, entry, output_dir):
         tmp_path = out_path.with_suffix(out_path.suffix + '.tmp')
         tmp_path.write_bytes(data)
         tmp_path.rename(out_path)
+        _emit('file', name)
         return (entry, None, False)
     except Exception as e:
         return (entry, str(e), False)
@@ -507,6 +513,8 @@ def _download_one_pack_entry(file_repo, entry, output_dir):
         data = fetch_bytes_pooled(url, count=True)
         tmp_file.write_bytes(data)
         tmp_file.rename(final_file)
+        # Archive name + chunk id gives the ticker its "files flying past" feel.
+        _emit('file', f"{entry['pack_name']} {ph:08x}")
         return (entry, None)
     except Exception as e:
         tmp_file.unlink(missing_ok=True)
@@ -608,10 +616,14 @@ def build_myp_archive(output_dir, pack_name, entries):
     """
     chunk_dir = Path(output_dir) / '.pack_staging' / pack_name
     if not chunk_dir.exists():
+        # Nothing to do -- still account for these entries so a caller's
+        # install_total (set across the whole batch) doesn't stall short of 100%.
+        _emit('install', len(entries))
         return
 
     out_path = Path(output_dir) / pack_name
     log(f"  Building MYP archive: {pack_name}")
+    _emit('install_name', pack_name)
 
     sorted_entries = sorted(entries, key=lambda e: int(e['ph'], 16))
 
@@ -630,6 +642,7 @@ def build_myp_archive(output_dir, pack_name, entries):
     # First pass: read chunks, decompress if needed
     file_records = []
     skipped = 0
+    install_done = 0  # entries processed so far this pass, for batched progress emits
 
     for entry in sorted_entries:
         ph = int(entry['ph'], 16)
@@ -641,6 +654,9 @@ def build_myp_archive(output_dir, pack_name, entries):
         if not chunk_file.exists():
             log(f"    WARN: missing chunk {ph:08x}{sh:08x} for {pack_name}, skipping entry")
             skipped += 1
+            install_done += 1
+            if install_done % 200 == 0:
+                _emit('install', 200)
             continue
 
         raw_data = chunk_file.read_bytes()
@@ -659,6 +675,12 @@ def build_myp_archive(output_dir, pack_name, entries):
             'data_size': data_size,
             'file_data': file_data,
         })
+        install_done += 1
+        if install_done % 200 == 0:
+            _emit('install', 200)
+
+    if install_done % 200:
+        _emit('install', install_done % 200)
 
     if skipped:
         log(f"    {skipped} entries skipped due to missing chunks")
@@ -752,6 +774,7 @@ def verify_archives(output_dir, pack_entries):
 
     Returns list of entries that failed verification (missing or size mismatch).
     """
+    _emit('install_total', len(pack_entries))
     output_dir = Path(output_dir)
     packs = {}
     for e in pack_entries:
@@ -759,12 +782,18 @@ def verify_archives(output_dir, pack_entries):
 
     total_ok = 0
     failed_entries = []
+    checked = 0
+    emitted = 0
 
     for pack_name, entries in packs.items():
         uop_path = output_dir / pack_name
         if not uop_path.exists():
             log(f"  VERIFY FAIL: {pack_name} not found")
             failed_entries.extend(entries)
+            checked += len(entries)
+            while checked - emitted >= 500:
+                _emit('install', 500)
+                emitted += 500
             continue
 
         index = read_uop_index(str(uop_path))
@@ -777,6 +806,13 @@ def verify_archives(output_dir, pack_entries):
                 failed_entries.append(entry)
             else:
                 total_ok += 1
+            checked += 1
+            while checked - emitted >= 500:
+                _emit('install', 500)
+                emitted += 500
+
+    if checked > emitted:
+        _emit('install', checked - emitted)
 
     if failed_entries:
         by_pack = {}
@@ -790,9 +826,12 @@ def verify_archives(output_dir, pack_entries):
 
 def verify_unpacked(output_dir, unpacked_entries):
     """Verify unpacked files. Returns list of entries that need re-download."""
+    _emit('install_total', len(unpacked_entries))
     output_dir = Path(output_dir)
     failed = []
     ok = 0
+    checked = 0
+    emitted = 0
 
     for entry in unpacked_entries:
         path = output_dir / entry['name']
@@ -801,6 +840,13 @@ def verify_unpacked(output_dir, unpacked_entries):
             failed.append(entry)
         else:
             ok += 1
+        checked += 1
+        if checked - emitted >= 500:
+            _emit('install', 500)
+            emitted += 500
+
+    if checked > emitted:
+        _emit('install', checked - emitted)
 
     log(f"  Unpacked verification: {ok} ok, {len(failed)} failed")
     return failed
@@ -927,6 +973,9 @@ def run_patch(output_dir, prod_url=None, workers=8, dry_run=False, no_verify=Fal
     # 5. Download remaining pack files with retry loop
     if all_packs:
         pack_names = set(e['pack_name'] for e in all_packs)
+        # Scanning is pre-download bookkeeping, not install work -- it stays off
+        # the Install bar (it finishes instantly on a fresh install and would
+        # pin that bar at 100% before any real installing has happened).
         _emit('phase', 'Scanning existing game files')
         log(f"\n[*] Scanning {len(pack_names)} .uop archives for incremental update...")
         pack_index = build_pack_index(output_dir, pack_names)
@@ -973,6 +1022,7 @@ def run_patch(output_dir, prod_url=None, workers=8, dry_run=False, no_verify=Fal
                 if e['pack_name'] in updated_packs:
                     pack_groups.setdefault(e['pack_name'], []).append(e)
 
+            _emit('install_total', sum(len(v) for v in pack_groups.values()))
             for pack_name, entries in pack_groups.items():
                 if pack_name not in official_uops:
                     log(f"  WARNING: {pack_name} has no EA unpacked download, building from chunks")
@@ -1002,9 +1052,10 @@ def run_patch(output_dir, prod_url=None, workers=8, dry_run=False, no_verify=Fal
 
                 # Rebuild only the affected archives
                 affected_packs = set(e['pack_name'] for e in failed_verify)
+                rebuild_groups = {pn: [e for e in all_packs if e['pack_name'] == pn] for pn in affected_packs}
+                _emit('install_total', sum(len(v) for v in rebuild_groups.values()))
                 for pack_name in affected_packs:
-                    pack_entries_for_rebuild = [e for e in all_packs if e['pack_name'] == pack_name]
-                    build_myp_archive(output_dir, pack_name, pack_entries_for_rebuild)
+                    build_myp_archive(output_dir, pack_name, rebuild_groups[pack_name])
 
                 # Clean staging for affected packs
                 staging_dir = Path(output_dir) / '.pack_staging'
@@ -1108,6 +1159,7 @@ def run_patcher_download(output_dir, workers=4, retries=MAX_RETRIES):
             for e in all_packs:
                 if e['pack_name'] not in official_uops:
                     pack_groups.setdefault(e['pack_name'], []).append(e)
+            _emit('install_total', sum(len(v) for v in pack_groups.values()))
             for pack_name, entries in pack_groups.items():
                 build_myp_archive(output_dir, pack_name, entries)
             shutil.rmtree(staging_dir, ignore_errors=True)
