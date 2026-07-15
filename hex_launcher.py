@@ -425,7 +425,14 @@ def launch(cuo_exe: Path) -> None:
             cmd.append("-skiploginscreen")
     except (OSError, json.JSONDecodeError):
         pass
-    subprocess.Popen(cmd, cwd=str(cuo_exe.parent))
+    # Fully detach the game from the launcher: a PyInstaller onefile exe must
+    # delete its _MEIxxxx temp dir when it exits, and anything the child keeps
+    # open there triggers the "Failed to remove temporary directory" warning.
+    kwargs = {}
+    if platform.system() == "Windows":
+        kwargs["creationflags"] = (subprocess.CREATE_NEW_PROCESS_GROUP
+                                   | subprocess.DETACHED_PROCESS)
+    subprocess.Popen(cmd, cwd=str(cuo_exe.parent), close_fds=True, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -579,6 +586,20 @@ def run_gui(args) -> int:
     header_label.pack(pady=(18, 0))
     tk.Label(root, text=f"{WEBSITE}  ·  Ultima Online, Renaissance era", font=("Georgia", 13),
              fg=DIM, bg=BG).pack()
+
+    # Server picker -- prominent, right under the title, so nobody ends up on
+    # the wrong shard without noticing (the old footer link was too quiet).
+    # The active shard's button is filled with that shard's accent color.
+    picker = tk.Frame(root, bg=BG)
+    picker.pack(pady=(8, 0))
+    hex_btn = tk.Button(picker, text="HEX", font=("Georgia", 11, "bold"),
+                        bd=1, relief="solid", padx=14, pady=2, cursor="hand2",
+                        command=lambda: pick_server("hex"))
+    hex_btn.pack(side="left", padx=(0, 8))
+    beta_btn = tk.Button(picker, text="HEX BETA", font=("Georgia", 11, "bold"),
+                         bd=1, relief="solid", padx=14, pady=2, cursor="hand2",
+                         command=lambda: pick_server("beta"))
+    beta_btn.pack(side="left")
 
     # ----- status: one friendly line for players -----
     status_var = tk.StringVar(value="Checking your installation ...")
@@ -971,9 +992,10 @@ def run_gui(args) -> int:
             show_verify()
 
         def fail(result):
+            # Existing account: prove the password is right before proceeding
+            # (previously this saved whatever was typed, unchecked).
             if "already exists" in result.get("message", ""):
-                save_login(state["settings_path"], email, pw)
-                account_done()
+                _login_then_done(email, pw)
 
         payload = {"email": email, "password": pw}
         if invite:
@@ -995,6 +1017,25 @@ def run_gui(args) -> int:
     def do_resend() -> None:
         api_call("/resend", {"email": state["email"]}, lambda _: None)
 
+    def _login_then_done(email: str, pw: str) -> None:
+        # Check the credentials against the ACTIVE shard's account API before
+        # anything else -- bad logins (or the right account on the wrong shard)
+        # must be caught here, not by the game server after the client opens.
+        def ok(_):
+            save_login(state["settings_path"], email, pw)
+            account_done()
+
+        def fail(result):
+            # Servers that predate /login answer 404 "Unknown endpoint." --
+            # fall back to the old save-and-go rather than locking players out.
+            if result.get("message") == "Unknown endpoint.":
+                save_login(state["settings_path"], email, pw)
+                account_done()
+            # Real rejections: the server's message is already on the status
+            # line (api_call shows it); stay on the login form.
+
+        api_call("/login", {"email": email, "password": pw}, ok, fail)
+
     def do_existing() -> None:
         email = email_e.get().strip()
         pw = pw_e.get()
@@ -1004,8 +1045,7 @@ def run_gui(args) -> int:
         if not pw:
             set_status("Type your password in the first password box too.")
             return
-        save_login(state["settings_path"], email, pw)
-        account_done()
+        _login_then_done(email, pw)
 
     def do_forgot() -> None:
         email = email_e.get().strip()
@@ -1037,7 +1077,10 @@ def run_gui(args) -> int:
         if state.get("cuo_exe") and state.get("client_dir"):
             write_settings(state["cuo_exe"], state["client_dir"])
         launch(state["cuo_exe"])
-        root.after(1200, on_close)
+        # Linger a moment before exiting: antivirus tends to scan the fresh
+        # game process right at spawn, and a too-early exit races the onefile
+        # bootloader's _MEI temp-dir cleanup (the "Failed to remove" warning).
+        root.after(3000, on_close)
 
     def do_uninstall() -> None:
         from tkinter import messagebox
@@ -1088,14 +1131,20 @@ def run_gui(args) -> int:
     # ----- server picker (always visible; toggles live shard <-> beta) -----
     def _refresh_server_ui() -> None:
         beta = active_server() == "beta"
-        server_btn.configure(text=f"Server: {server_name()}")
         header_label.configure(text="HEX BETA" if beta else "HEX",
                                fg=BETA_ACCENT if beta else ACCENT)
         root.title(f"Hex Launcher — BETA — {WEBSITE}" if beta
                    else f"{SHARD_NAME} Launcher — {WEBSITE}")
+        hex_btn.configure(bg=BG if beta else ACCENT, fg=DIM if beta else BG,
+                          activebackground=BG if beta else ACCENT,
+                          activeforeground=DIM if beta else BG)
+        beta_btn.configure(bg=BETA_ACCENT if beta else BG, fg=BG if beta else DIM,
+                           activebackground=BETA_ACCENT if beta else BG,
+                           activeforeground=BG if beta else DIM)
 
-    def toggle_server() -> None:
-        new = "beta" if active_server() == "hex" else "hex"
+    def pick_server(new: str) -> None:
+        if new == active_server():
+            return
         set_active_server(new)
         save_server(new)
         _refresh_server_ui()
@@ -1109,11 +1158,6 @@ def run_gui(args) -> int:
             if new == "beta":
                 set_status("Connected to the BETA shard — separate accounts and characters.")
 
-    server_btn = tk.Button(root, text=f"Server: {server_name()}", command=toggle_server,
-                           font=("Georgia", 9), fg=DIM, bg=BG, bd=0,
-                           activebackground=BG, activeforeground=FG,
-                           highlightthickness=0, cursor="hand2")
-    server_btn.pack(side="bottom", pady=(0, 2))
     _refresh_server_ui()
 
     play_btn.configure(command=do_play)
